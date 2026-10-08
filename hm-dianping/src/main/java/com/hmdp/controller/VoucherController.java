@@ -22,7 +22,7 @@ public class VoucherController {
 
     @Resource
     private IVoucherService voucherService;
-//test03
+//test04
     /**
      * 新增普通券
      * @param voucher 优惠券信息
