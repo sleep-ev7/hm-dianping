@@ -128,24 +128,34 @@ public class CacheClient {
 
         //4.2已过期需要缓存重建
         //5.缓存重建
-        //【BUG】这里用 keyPrefix 拼锁键，得到的锁键和上面的缓存键 key 完全相同！
-        //  根因：此时缓存键必然存在，setIfAbsent 必然返回 false → 永远抢不到锁 →
-        //  重建任务永远不会提交 → 过期数据永久停留在旧值。即使抢到也会把缓存值覆盖成 "1"。
-        //  修法：锁键必须独立命名（如传入独立的 lockKeyPrefix，或用 "lock:" + key 生成）。
-        String lockKey = keyPrefix + id;
+        //【已修复】原先这里写的是 `String lockKey = keyPrefix + id;`，
+        //  拼出来的锁键和上面的缓存键 key 完全相同 —— 而此时缓存键必然存在，
+        //  于是 setIfAbsent 必然返回 false → 永远抢不到锁 → 重建任务永远不会提交，
+        //  过期数据永久停留在旧值；更糟的是若真抢到，会把缓存值覆盖成 "1"，
+        //  下次再查就会 JSON 解析失败。
+        //  修法：锁键用独立的 "lock:" 前缀命名，与缓存键彻底区分开。
+        String lockKey = LOCK_SHOP_KEY + id;
         //5.1 抢锁：保证只有一个线程去重建，避免缓存刚过期就有一批线程同时打数据库
         boolean isLock = tryLock(lockKey);
         //5.2 抢到锁 → 提交后台线程重建，注意没有 join，主线程立刻往下走
         if(isLock){
-            //TODO 5.3成功开启独立线程 实现缓存重建
+            //5.3 成功开启独立线程 实现缓存重建
             CACHE_REBUILD_EXECUTOR.submit(() ->{
                 try {
                     //重建缓存：查库后按逻辑过期格式重新写入，得到一份"新鲜旧值"
                     R r1 = dbFallback.apply(id);
-                    this.setWithLogicalExpire(key, r1, time, unit);
+                    //【加固】查库可能返回 null（数据被删了）。此时若照旧写入，
+                    //  RedisData.data 为 null，下次解析时 (JSONObject) null 会抛异常。
+                    //  这里改为：查不到就删掉缓存键，让它下次走"未命中"分支。
+                    if (r1 == null) {
+                        stringRedisTemplate.delete(key);
+                        log.warn("缓存重建时数据库无此数据，已删除缓存键：{}", key);
+                    } else {
+                        this.setWithLogicalExpire(key, r1, time, unit);
+                    }
                 } catch (Exception e) {
-                    //异步线程里抛异常没人接，重建会静默失败；生产环境应记日志
-                    throw new RuntimeException(e);
+                    //异步线程里抛异常没人接，重建会静默失败；这里记日志便于排查
+                    log.error("缓存重建失败，key={}", key, e);
                 } finally {
                     //释放锁：成功失败都要放，否则后续请求永远抢不到锁、数据再也不会更新
                     unLock(lockKey);

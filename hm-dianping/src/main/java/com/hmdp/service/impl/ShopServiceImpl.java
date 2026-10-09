@@ -84,6 +84,37 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     }
 
     /**
+     * 清掉指定商铺的缓存键（含可能残留的「空值标记」）。
+     *
+     * <p>
+     * 【为什么需要它】{@link CacheClient#queryWithPassThrough} 在"库里查不到"时会把空串 {@code ""}
+     * 写进 {@code cache:shop:{id}} 当作「此 id 不存在」的标记（TTL = {@code CACHE_NULL_TTL}，默认 2 分钟）。
+     * 之后 2 分钟内即使数据库里已经有这条数据，查询也会命中这个空值标记、<b>直接返回 null 而不查库</b>，
+     * 于是接口返回 {@code Result.fail("店铺不存在")}。
+     * 前端 {@code shop-detail.html} 收到失败响应后 {@code shop} 仍是 {@code {}}，
+     * 模板里 {@code shop.score/10} 就成了 {@code undefined/10} = <b>NaN</b>（el-rate 的 show-score 会原样显示）。
+     * </p>
+     *
+     * <p>
+     * 因此：<b>新增/修改/重建商铺数据后，务必调用本方法清掉旧键</b>，否则会被空值标记挡住。
+     * 这也是 {@link #update(Shop)} 里删缓存的原因；此处额外暴露一个按 id 清理的口子，
+     * 方便在测试、数据修复、缓存预热等场景手动使用。
+     * </p>
+     *
+     * @param id 商铺 id；为 null 时不做任何事
+     * @return true 表示确实删掉了一个键（含空值标记），false 表示该键本就不存在
+     */
+    public boolean evictCache(Long id) {
+        if (id == null) {
+            return false;
+        }
+        //delete 返回 Boolean（键存在且被删除为 true）；用 BooleanUtil 做空安全转换，
+        //避免 Redis 连接异常返回 null 时拆箱 NPE
+        Boolean deleted = stringRedisTemplate.delete(CACHE_SHOP_KEY + id);
+        return BooleanUtil.isTrue(deleted);
+    }
+
+    /**
      * 【仅作参考，当前无人调用】互斥锁，解决缓存击穿。
      *
      * <p>

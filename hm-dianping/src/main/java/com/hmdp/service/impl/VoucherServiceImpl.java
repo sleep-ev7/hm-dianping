@@ -59,7 +59,6 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
 
     @Override
     public Result addVoucher(Voucher voucher) {
-
         return null;
     }
 }
