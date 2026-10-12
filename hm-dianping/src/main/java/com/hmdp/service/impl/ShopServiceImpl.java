@@ -3,17 +3,25 @@ package com.hmdp.service.impl;
 import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.CacheClient;
+import com.hmdp.utils.SystemConstants;
+import org.springframework.data.geo.Distance;
+import org.springframework.data.geo.GeoResult;
+import org.springframework.data.geo.GeoResults;
+import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.domain.geo.GeoReference;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
 
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 
 import static com.hmdp.utils.RedisConstants.*;
@@ -39,12 +47,17 @@ import static com.hmdp.utils.RedisConstants.*;
 @Service
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
 
-    /** 操作 Redis 的模板；用 String 版是因为缓存里存的是 JSON 字符串，便于人肉排查 */
+    /**
+     * 操作 Redis 的模板；用 String 版是因为缓存里存的是 JSON 字符串，便于人肉排查
+     */
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
     @Resource
     private CacheClient cacheClient;
+
+    @Resource
+    private IShopService shopService;
 
     /**
      * 根据 id 查询商铺详情（对外统一入口）。
@@ -75,7 +88,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 //                cacheClient.queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
         // 若改用缓存空对象方案，把这行换成：
         Shop shop =
-         cacheClient.queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+                cacheClient.queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
 
         if (shop == null) {
             return Result.fail("店铺不存在");
@@ -144,13 +157,13 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         //1.从redis查询商店缓存
         String shopJson = stringRedisTemplate.opsForValue().get(key);
         //2.判断是否存在
-        if(StrUtil.isNotBlank(shopJson)){
+        if (StrUtil.isNotBlank(shopJson)) {
             //2.1 缓存命中，反序列化后直接返回，注意这里完全不会碰数据库
             return JSONUtil.toBean(shopJson, Shop.class);
         }
 
         //判断命中是否为空值
-        if(shopJson != null){
+        if (shopJson != null) {
             //返回一个错误信息
             //3.命中的是缓存的空值标记，确认不存在，直接返回 null
             return null;
@@ -165,7 +178,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             boolean isLock = tryLock(lockKey);
 
             //4.2判断是否成功
-            if(!isLock){
+            if (!isLock) {
                 //4.3失败，则休眠重试
                 //4.3 没抢到锁：说明已有线程在重建，等一小会儿再重试（此处缺少 return，见方法说明）
                 Thread.sleep(50);
@@ -179,10 +192,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             //（教学用：放大重建耗时，方便观察并发时的现象，真实项目里应删掉）
             Thread.sleep(200);
             //5.不存在返回数据
-            if(shop == null){
+            if (shop == null) {
                 //将空值写入数据库
                 //5.1 数据库也没有：缓存空值防穿透，同样返回 null
-                stringRedisTemplate.opsForValue().set(key,"",CACHE_NULL_TTL,TimeUnit.MINUTES);
+                stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
                 return null;
             }
             //6.存在，写入redis
@@ -220,7 +233,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
      * @param key 锁的键名，本项目格式为 {@code lock:shop:{id}}
      * @return true 表示抢锁成功
      */
-    private boolean tryLock(String key){
+    private boolean tryLock(String key) {
         Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", 10, TimeUnit.SECONDS);
         //setIfAbsent 可能返回 null（连接异常等），用 BooleanUtil 做空安全判断
         return BooleanUtil.isTrue(flag);
@@ -238,7 +251,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
      *
      * @param key 要释放的锁键名
      */
-    private void unLock(String key){
+    private void unLock(String key) {
         stringRedisTemplate.delete(key);
     }
 
@@ -266,5 +279,55 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         stringRedisTemplate.delete(CACHE_SHOP_KEY + id);
 
         return Result.ok();
+    }
+
+
+    @Override
+    public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
+        //1. 判断是否需要根据距离查询
+        if (x == null || y == null) {
+            // 根据类型分页查询
+            Page<Shop> page = query()
+                    .eq("type_id", typeId)
+                    .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
+            // 返回数据
+            return Result.ok(page.getRecords());
+        }
+        //2. 计算分页查询参数
+        int from = (current - 1) * SystemConstants.MAX_PAGE_SIZE;
+        int end = current * SystemConstants.MAX_PAGE_SIZE;
+        String key = SHOP_GEO_KEY + typeId;
+        //3. 查询redis、按照距离排序、分页; 结果：shopId、distance
+        //GEOSEARCH key FROMLONLAT x y BYRADIUS 5000 m WITHDIST
+        GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo().search(key,
+                GeoReference.fromCoordinate(x, y),
+                new Distance(5000),
+                RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs().includeDistance().limit(end));
+        if (results == null) {
+            return Result.ok(Collections.emptyList());
+        }
+        //4. 解析出id
+        List<GeoResult<RedisGeoCommands.GeoLocation<String>>> list = results.getContent();
+        if (list.size() <= from) {
+            //起始查询位置大于数据总量，则说明没数据了，返回空集合
+            return Result.ok(Collections.emptyList());
+        }
+        ArrayList<Long> ids = new ArrayList<>(list.size());
+        HashMap<String, Distance> distanceMap = new HashMap<>(list.size());
+        list.stream().skip(from).forEach(result -> {
+            String shopIdStr = result.getContent().getName();
+            ids.add(Long.valueOf(shopIdStr));
+            Distance distance = result.getDistance();
+            distanceMap.put(shopIdStr, distance);
+        });
+        //5. 根据id查询shop
+        String idsStr = StrUtil.join(",", ids);
+        List<Shop> shops = query().in("id", ids).last("ORDER BY FIELD( id," + idsStr + ")").list();
+        for (Shop shop : shops) {
+            //设置shop的举例属性，从distanceMap中根据shopId查询
+            shop.setDistance(distanceMap.get(shop.getId().toString()).getValue());
+        }
+        //6. 返回
+        return Result.ok(shops);
     }
 }
